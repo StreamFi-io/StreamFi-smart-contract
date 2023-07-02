@@ -1,1 +1,1 @@
-# sreamFi-smart-contract
+# StreamFi-smart-contract
