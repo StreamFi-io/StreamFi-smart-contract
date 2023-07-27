@@ -1612,6 +1612,45 @@ contract DIARandomOracle {
 }
 
 pragma solidity ^0.8.0;
+library MerkleProof {
+    function verify(
+        bytes32[] memory proof,
+        bytes32 root,
+        bytes32 leaf
+    ) internal pure returns (bool) {
+        return processProof(proof, leaf) == root;
+    }
+    function processProof(bytes32[] memory proof, bytes32 leaf)
+        internal
+        pure
+        returns (bytes32)
+    {
+        bytes32 computedHash = leaf;
+        for (uint256 i = 0; i < proof.length; i++) {
+            bytes32 proofElement = proof[i];
+            if (computedHash <= proofElement) {
+                computedHash = _efficientHash(computedHash, proofElement);
+            } else {
+                computedHash = _efficientHash(proofElement, computedHash);
+            }
+        }
+        return computedHash;
+    }
+
+    function _efficientHash(bytes32 a, bytes32 b)
+        private
+        pure
+        returns (bytes32 value)
+    {
+        assembly {
+            mstore(0x00, a)
+            mstore(0x20, b)
+            value := keccak256(0x00, 0x40)
+        }
+    }
+}
+
+pragma solidity ^0.8.0;
 
 contract StreamFi_V1 is
     Initializable,
@@ -1626,10 +1665,12 @@ contract StreamFi_V1 is
     using SafeMath for uint256;
     using Strings for uint256;
 
-    uint16 _mul = 80;
+    bytes32 root;
 
-    uint16 public CURRENT_TOKEN = 0;
-    address public TREASURE = 0xc74370feac90EE0E8AAda104B90447C92C11A1FA;
+    uint16 public Creator_Cut;
+    uint16 public Platform_Fee;
+    uint16 public CURRENT_TOKEN;
+    address public TREASURE;
 
     mapping(uint256 => StreamFi) public STREAMFI;
     struct StreamFi {
@@ -1638,6 +1679,9 @@ contract StreamFi_V1 is
         uint256 tokenPrice;
         uint256 maxSupply;
         string CID;
+        address payable PAYOUTADDRESS;
+        uint256 availableBalance;
+        uint256 lastWithdrawTime;
     }
 
     mapping(uint256 => StreamFi_Gem) public STREAMFIGEM;
@@ -1647,14 +1691,12 @@ contract StreamFi_V1 is
         string CID;
     }
 
-    mapping(address => uint256[]) public createdTokens;
-    mapping(address => bool) public ARTISTS;
+    mapping(address => uint256[]) internal createdTokens;
     mapping(uint256 => address) public creatorOf;
-    mapping(uint256 => uint256) internal ARTIST_BALANCE_CLAIMED;
     mapping(uint256 => mapping(uint256 => address)) public tokenIndex;
-    mapping(uint256 => address) public PAYOUTADDRESS;
 
     event TokenCreated(uint256 indexed token_id, address creator);
+    event BalanceWithdrawn(uint256 indexed token_id, address receiver, uint256 amount);
 
     address public randomOracle;
 
@@ -1669,7 +1711,6 @@ contract StreamFi_V1 is
         __ERC1155Burnable_init();
         __ERC1155Supply_init();
         __UUPSUpgradeable_init();
-        randomOracle = 0x8A81965D4c6D92DCbBd537A178c7C29Dc1C37bA2;
     }
 
     function supportsInterface(bytes4 interfaceId)
@@ -1706,12 +1747,29 @@ contract StreamFi_V1 is
         return createdTokens[_address];
     }
 
-    function Add_Artist(address _Address) public onlyOwner {
-        ARTISTS[_Address] = true;
+    function verify(bytes32[] memory proof) internal view returns (bool) {
+        bytes32 leaf = keccak256(abi.encodePacked(msg.sender));
+        return MerkleProof.verify(proof, root, leaf);
     }
 
-    function Remove_Artist(address _Address) public onlyOwner {
-        ARTISTS[_Address] = false;
+    function Set_Creator_Cut(uint16 _Creator_Cut) public onlyOwner {
+        Creator_Cut = _Creator_Cut;
+    }
+
+    function Set_Platform_Fee(uint16 _Platform_Fee) public onlyOwner {
+        Platform_Fee = _Platform_Fee;
+    }
+
+    function Set_Treasure(address _address) public onlyOwner {
+        TREASURE = _address;
+    }
+
+    function Set_RANDAORANDOMNESS(address _address) public onlyOwner {
+        randomOracle = _address;
+    }
+
+    function setRoot(bytes32 _root) external onlyOwner {
+        root = _root;
     }
 
     function mint_token(uint256 tokenID) external payable {
@@ -1728,6 +1786,7 @@ contract StreamFi_V1 is
         require(StreamFiToken.tokenPrice == msg.value, "PRICE_WAS_INCORRECT");
         require(balanceOf(msg.sender, tokenID) == 0, "ALREADY_MINTED");
         tokenIndex[tokenID][totalSupply(tokenID)] = msg.sender;
+        StreamFiToken.availableBalance = StreamFiToken.availableBalance.add(msg.value);
         _mint(msg.sender, tokenID, 1, "");
     }
 
@@ -1739,10 +1798,9 @@ contract StreamFi_V1 is
         uint256 _totalGems,
         address _payoutAddress,
         uint96 _royaltyPercentage,
-        string memory _CID,
-        string memory _CID_GEM
+        bytes32[] memory proof
     ) external {
-        require(ARTISTS[msg.sender], "ONLY_APPROVED_ARTISTS_CAN_CREATE_TOKEN");
+        require(verify(proof), "ONLY_APPROVED_ARTISTS_CAN_CREATE_TOKEN");
         require(
             _startTime >= block.timestamp,
             "START_TIME_SHOULD_BE_GREATER_THEN_CURRENT_TIME"
@@ -1760,9 +1818,7 @@ contract StreamFi_V1 is
             _tokenPrice,
             _totalGems,
             _payoutAddress,
-            _royaltyPercentage,
-            _CID,
-            _CID_GEM
+            _royaltyPercentage
         );
     }
 
@@ -1773,9 +1829,7 @@ contract StreamFi_V1 is
         uint256 _tokenPrice,
         uint256 _totalGems,
         address _payoutAddress,
-        uint96 _royaltyPercentage,
-        string memory _CID,
-        string memory _CID_GEM
+        uint96 _royaltyPercentage
     ) internal {
         CURRENT_TOKEN++;
         StreamFi storage StreamFiToken = STREAMFI[CURRENT_TOKEN];
@@ -1783,9 +1837,8 @@ contract StreamFi_V1 is
         StreamFiToken.endTime = _endTime;
         StreamFiToken.maxSupply = _maxSupply;
         StreamFiToken.tokenPrice = _tokenPrice;
-        StreamFiToken.CID = _CID;
+        StreamFiToken.PAYOUTADDRESS = payable(_payoutAddress);
         creatorOf[CURRENT_TOKEN] = msg.sender;
-        PAYOUTADDRESS[CURRENT_TOKEN] = _payoutAddress;
         createdTokens[msg.sender].push(CURRENT_TOKEN);
         _setTokenRoyalty(CURRENT_TOKEN, _payoutAddress, _royaltyPercentage);
         emit TokenCreated(CURRENT_TOKEN, msg.sender);
@@ -1793,7 +1846,6 @@ contract StreamFi_V1 is
             CURRENT_TOKEN++;
             StreamFi_Gem storage StreamFiGem = STREAMFIGEM[CURRENT_TOKEN];
             StreamFiGem.totalGems = _totalGems;
-            StreamFiGem.CID = _CID_GEM;
             creatorOf[CURRENT_TOKEN] = msg.sender;
             _setTokenRoyalty(CURRENT_TOKEN, _payoutAddress, _royaltyPercentage);
         }
@@ -1848,44 +1900,54 @@ contract StreamFi_V1 is
         payable(msg.sender).transfer(address(this).balance);
     }
 
-    function Withdraw_Artist_Balance(uint256 _tokenID) external {
+    function Withdraw_Artist_Balance(uint256[] calldata tokenIDs) external {
         require(address(this).balance > 0, "CONTRACT_BALANCE_IS_ZERO");
-        require(creatorOf[_tokenID] == msg.sender, "NO_SWEEPING");
-        StreamFi storage StreamFiToken = STREAMFI[_tokenID];
-        uint256 AVAILABLE_BALANCE_ARTIST = StreamFiToken
-            .tokenPrice
-            .mul(totalSupply(_tokenID))
-            .sub(ARTIST_BALANCE_CLAIMED[_tokenID])
-            .div(100)
-            .mul(80);
-        uint256 AVAILABLE_BALANCE_TREASURE = StreamFiToken
-            .tokenPrice
-            .mul(totalSupply(_tokenID))
-            .sub(ARTIST_BALANCE_CLAIMED[_tokenID])
-            .div(100)
-            .mul(20);
-        require(AVAILABLE_BALANCE_ARTIST > 0, "BALANCE_IS_ZERO");
-        ARTIST_BALANCE_CLAIMED[_tokenID] +=
-            AVAILABLE_BALANCE_ARTIST +
-            AVAILABLE_BALANCE_TREASURE;
-        _distributeGemsRandomly(_tokenID);
-        payable(PAYOUTADDRESS[_tokenID]).transfer(AVAILABLE_BALANCE_ARTIST);
-        payable(TREASURE).transfer(AVAILABLE_BALANCE_TREASURE);
+        for (uint256 i = 0; i < tokenIDs.length; i++) {
+            uint256 _tokenID = tokenIDs[i];
+            require(creatorOf[_tokenID] == msg.sender, "NO_SWEEPING");
+            StreamFi storage StreamFiToken = STREAMFI[_tokenID];
+            uint256 AVAILABLE_BALANCE_ARTIST = StreamFiToken.availableBalance.mul(Creator_Cut).div(100);
+            uint256 AVAILABLE_BALANCE_TREASURE = StreamFiToken.availableBalance.mul(Platform_Fee).div(100);
+            require(AVAILABLE_BALANCE_ARTIST > 0, "BALANCE_IS_ZERO");
+            StreamFiToken.lastWithdrawTime = block.timestamp;
+            payable(StreamFiToken.PAYOUTADDRESS).transfer(AVAILABLE_BALANCE_ARTIST);
+            payable(TREASURE).transfer(AVAILABLE_BALANCE_TREASURE);
+            emit BalanceWithdrawn(_tokenID, StreamFiToken.PAYOUTADDRESS, AVAILABLE_BALANCE_ARTIST);
+        }
     }
 
-    function Get_My_Balance_By_Token_ID(uint256 _tokenID)
-        public
-        view
-        returns (uint256 _amount)
-    {
-        StreamFi storage StreamFiToken = STREAMFI[_tokenID];
-        return
-            StreamFiToken
-                .tokenPrice
-                .mul(totalSupply(_tokenID))
-                .sub(ARTIST_BALANCE_CLAIMED[_tokenID])
-                .div(100)
-                .mul(80);
+    function Get_Available_Balance_Artist(uint256[] calldata tokenIDs) external view returns (uint256) {
+        uint256 totalAvailableBalance = 0;
+        for (uint256 i = 0; i < tokenIDs.length; i++) {
+            uint256 _tokenID = tokenIDs[i];
+            StreamFi storage StreamFiToken = STREAMFI[_tokenID];
+            uint256 AVAILABLE_BALANCE_ARTIST = StreamFiToken.availableBalance.mul(Creator_Cut).div(100);
+            totalAvailableBalance += AVAILABLE_BALANCE_ARTIST;
+        }
+        return totalAvailableBalance;
+    }
+
+    function Get_All_IDs_Available_Balance(address artistAddress) external view returns (uint256[] memory) {
+        uint256[] memory allIDs = Get_All_IDS_By_Address(artistAddress);
+        uint256[] memory positiveBalanceIDs = new uint256[](allIDs.length);
+        uint256 count = 0;
+
+        for (uint256 i = 0; i < allIDs.length; i++) {
+            uint256 _tokenID = allIDs[i];
+            StreamFi storage StreamFiToken = STREAMFI[_tokenID];
+            uint256 AVAILABLE_BALANCE_ARTIST = StreamFiToken.availableBalance.mul(Creator_Cut).div(100);
+            if (AVAILABLE_BALANCE_ARTIST > 0) {
+                positiveBalanceIDs[count] = _tokenID;
+                count++;
+            }
+        }
+
+        uint256[] memory result = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = positiveBalanceIDs[i];
+        }
+
+        return result;
     }
 
     function getRandomValue() public view returns (string memory) {
@@ -1895,6 +1957,28 @@ contract StreamFi_V1 is
             );
     }
 
+    function Test_Winner_Function(uint256 _tokenID)
+        public
+        view
+        returns (address[2] memory winners)
+    {
+        uint256 gemID = (_tokenID + 1);
+        StreamFi_Gem storage StreamFiGem = STREAMFIGEM[gemID];
+        if (StreamFiGem.winners.length == 0 && StreamFiGem.totalGems > 0) {
+            string memory rand = getRandomValue();
+            for (uint256 i = 0; i < StreamFiGem.totalGems; i++) {
+                bytes32 hash = keccak256(
+                    abi.encodePacked(i, block.timestamp, rand, _tokenID)
+                );
+                uint256 resultPart = (uint256(hash));
+                uint256 result = resultPart % totalSupply(_tokenID);
+                address winner = tokenIndex[_tokenID][result];
+                winners[i] = winner;
+            }
+        }
+        return winners;
+    }
+
     function uri(uint256 tokenId)
         public
         view
@@ -1902,17 +1986,14 @@ contract StreamFi_V1 is
         override
         returns (string memory)
     {
-        require(
-            exists(tokenId),
-            "ERC1155Metadata: URI query for nonexistent token"
-        );
         StreamFi_Gem storage StreamFiGem = STREAMFIGEM[tokenId];
         StreamFi storage StreamFiToken = STREAMFI[tokenId];
         if(StreamFiGem.totalGems > 0){
-            return string(abi.encodePacked("ipfs://", StreamFiGem.CID, "/metadata.json"));
+            return string(abi.encodePacked("ifps/", StreamFiGem.CID, "/metadata.json"));
         }
         if(StreamFiToken.maxSupply > 0){
-            return string(abi.encodePacked("ipfs://", StreamFiToken.CID, "/metadata.json"));
+            return string(abi.encodePacked("ifps/", StreamFiToken.CID, "/metadata.json"));
         }
+        return "";
     }
 }
